@@ -1,7 +1,9 @@
 import contextlib
+import http.client
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 import urllib.error
@@ -148,6 +150,101 @@ class StreamTranslationTest(QuietMixin, unittest.TestCase):
         self.assertNotIn("temperature", sent["body"])
 
 
+TOOL_USE = [
+    ("message_start", {"message": {"usage": {"input_tokens": 1}}}),
+    ("content_block_start", {"content_block": {"type": "text"}}),
+    ("content_block_delta", {"delta": {"type": "text_delta", "text": "Looking. "}}),
+    ("content_block_stop", {}),
+    ("content_block_start", {"content_block": {"type": "tool_use", "name": "look",
+                                               "input": {}}}),
+    ("content_block_delta", {"delta": {"type": "input_json_delta", "partial_json": ""}}),
+    ("content_block_delta", {"delta": {"type": "input_json_delta", "partial_json": '{"tar'}}),
+    ("content_block_delta", {"delta": {"type": "input_json_delta",
+                                       "partial_json": 'get": "door", "n": 2}'}}),
+    ("content_block_stop", {}),
+    ("content_block_start", {"content_block": {"type": "tool_use", "name": "wait",
+                                               "input": {}}}),
+    ("content_block_stop", {}),
+    ("message_delta", {"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}),
+    ("message_stop", {}),
+]
+
+
+def _stop_events(raw):
+    evs = [json.loads(l[6:]) for l in raw.decode().splitlines() if l.startswith("data: ")]
+    return [e for e in evs if e.get("stop")]
+
+
+class ToolCallStreamingTest(QuietMixin, unittest.TestCase):
+    """Regression: input_json_delta was dropped (tool calls streamed with no
+    arguments plus a stray `}`), and block-type state lived on the function
+    object, shared by every concurrent request."""
+
+    def _run(self, events):
+        with mock.patch.object(clp.urllib.request, "urlopen",
+                               return_value=FakeStream(anthropic_sse(events))):
+            return "".join(clp.stream_claude_response([], [{"role": "user", "content": "x"}],
+                                                       "K", capture={}))
+
+    def test_tool_arguments_forwarded_and_envelope_is_valid_json(self):
+        text = sse_text(self._run(TOOL_USE).encode())
+        calls = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.S)
+        self.assertEqual([json.loads(c) for c in calls], [
+            {"name": "look", "arguments": {"target": "door", "n": 2}},
+            {"name": "wait", "arguments": {}},           # no-input tool → {}
+        ])
+        self.assertTrue(text.startswith("Looking. <tool_call>"))
+
+    def test_exactly_one_stop_event(self):
+        stops = _stop_events(self._run(HAPPY).encode())
+        self.assertEqual(len(stops), 1)
+        self.assertNotIn("degraded", stops[0])
+
+    def test_no_block_state_on_function_object(self):
+        self._run(TOOL_USE)
+        self.assertFalse(hasattr(clp.stream_claude_response, "_current_block_type"))
+
+    def test_interleaved_streams_do_not_share_block_state(self):
+        # Drive two generators step by step, alternating: one inside a tool_use
+        # block, the other inside a thinking block. Shared state would close one
+        # with the other's tag.
+        thinking = [
+            ("content_block_start", {"content_block": {"type": "thinking"}}),
+            ("content_block_delta", {"delta": {"type": "thinking_delta", "thinking": "hm"}}),
+            ("content_block_stop", {}),
+            ("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {}}),
+            ("message_stop", {}),
+        ]
+        tool = TOOL_USE[4:9] + TOOL_USE[11:]
+        streams = iter([FakeStream(anthropic_sse(tool), chunk=4096),
+                        FakeStream(anthropic_sse(thinking), chunk=4096)])
+        with mock.patch.object(clp.urllib.request, "urlopen",
+                               side_effect=lambda *a, **k: next(streams)):
+            g1 = clp.stream_claude_response([], [{"role": "user", "content": "a"}], "K")
+            g2 = clp.stream_claude_response([], [{"role": "user", "content": "b"}], "K")
+            out1, out2 = [next(g1)], [next(g2)]   # both now inside their open block
+            out1 += list(g1)
+            out2 += list(g2)
+        t1, t2 = sse_text("".join(out1).encode()), sse_text("".join(out2).encode())
+        self.assertEqual(json.loads(re.search(r"<tool_call>(.*)</tool_call>", t1).group(1)),
+                         {"name": "look", "arguments": {"target": "door", "n": 2}})
+        self.assertNotIn("</think>", t1)
+        self.assertEqual(t2, "<think>hm</think>")
+
+    def test_error_event_is_marked_degraded(self):
+        stops = _stop_events(self._run(
+            [("content_block_start", {"content_block": {"type": "text"}}),
+             ("error", {"error": {"message": "Overloaded"}})]).encode())
+        self.assertEqual(stops[-1]["degraded"], "error")
+
+    def test_http_error_is_marked_degraded(self):
+        err = urllib.error.HTTPError(clp.CLAUDE_API_URL, 400, "bad", {}, io.BytesIO(b"{}"))
+        self.addCleanup(err.close)
+        with mock.patch.object(clp.urllib.request, "urlopen", side_effect=err):
+            raw = "".join(clp.stream_claude_response([], [{"role": "user", "content": "x"}], "K"))
+        self.assertEqual(_stop_events(raw.encode())[-1]["degraded"], "error")
+
+
 class HandlerFallbackTest(QuietMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -171,10 +268,20 @@ class HandlerFallbackTest(QuietMixin, unittest.TestCase):
             status, ctype, raw = post_json(self.url, self.body)
         self.assertEqual(status, 200)
         self.assertEqual(sse_text(raw), clp.FALLBACK_TEXT)
+        # marked so a cache in front never stores it (header + stop-event field)
+        self.assertEqual(_stop_events(raw)[-1].get("degraded"), "fallback")
+        conn = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+        conn.request("POST", "/completion", body=json.dumps(self.body).encode(),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.getheader("X-LLM-Degraded"), "fallback")
 
     def test_terminal_api_error_becomes_fallback_not_raw_error(self):
         err = urllib.error.HTTPError(clp.CLAUDE_API_URL, 401, "unauthorized", {},
                                      io.BytesIO(b'{"error":"bad key"}'))
+        self.addCleanup(err.close)
         with mock.patch.object(clp.urllib.request, "urlopen", side_effect=err), \
                 mock.patch.object(clp.time, "sleep"):
             status, _, raw = post_json(self.url, self.body)
@@ -182,6 +289,9 @@ class HandlerFallbackTest(QuietMixin, unittest.TestCase):
         text = sse_text(raw)
         self.assertEqual(text, clp.FALLBACK_TEXT)
         self.assertNotIn("401", text)
+        stops = _stop_events(raw)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0].get("degraded"), "fallback")
 
     def test_happy_path_streams_translated_text(self):
         with mock.patch.object(clp.urllib.request, "urlopen",
@@ -190,6 +300,46 @@ class HandlerFallbackTest(QuietMixin, unittest.TestCase):
             _, ctype, raw = post_json(self.url, self.body)
         self.assertIn("text/event-stream", ctype)
         self.assertEqual(sse_text(raw), "Héllo, world")
+        stops = _stop_events(raw)
+        self.assertEqual(len(stops), 1)                 # no double stop event
+        self.assertNotIn("degraded", stops[0])
+
+
+class EndToEndCacheChainTest(QuietMixin, unittest.TestCase):
+    """client → cache-proxy → claude-proxy: the budget fallback must reach the
+    client but never become a cached variant."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile as _tf
+        self.cp = load_proxy("cache-proxy.py", "cache_proxy_chain")
+        self.env = mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"})
+        self.env.start()
+        self.claude = RunningServer(clp.ClaudeProxyHandler)
+        self.tmp = _tf.mkdtemp()
+        self.cp.UPSTREAM = ("127.0.0.1", self.claude.port)
+        self.cp.CACHE = self.cp.VariantCache(os.path.join(self.tmp, "c.json"), model_tag="h")
+        self.cache = RunningServer(self.cp.Handler)
+
+    def tearDown(self):
+        self.cache.close()
+        self.claude.close()
+        self.env.stop()
+        clp.BUDGET = None
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        super().tearDown()
+
+    def test_fallback_through_cache_proxy_is_not_stored(self):
+        clp.BUDGET = clp.Budget(per_hour=1)
+        clp.BUDGET.allow()
+        body = {"prompt": "<|im_start|>user\nhi<|im_end|>", "cacheable": True,
+                "cache_key": "|v|S01|x", "stream": True}
+        status, _, raw = post_json(self.cache.url + "/completion", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(sse_text(raw), clp.FALLBACK_TEXT)
+        self.assertEqual(self.cp.CACHE.candidates("|v|S01|x"), [])
+        self.assertEqual(self.cp.CACHE.stats()["refused"], 1)
 
 
 if __name__ == "__main__":

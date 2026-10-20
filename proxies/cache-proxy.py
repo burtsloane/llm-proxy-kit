@@ -15,7 +15,7 @@ Any request without `cacheable:true`+`cache_key` is pure pass-through (so other
 callers — other apps, free-text requests that must stay live — are untouched).
 
 Pooled variants: each key holds a LIST of responses; a hit rotates through them
-(hits % N) so replays vary. `regen:true` bypasses the read and APPENDS a fresh variant
+(a per-key hits % N counter) so replays vary. `regen:true` bypasses the read and APPENDS a fresh variant
 — the "fatten this node" button. `--model-tag` stamps variants and refuses to serve a
 different backend's text (the no-cross-model-bleed guard, which matters more now that
 backends are swappable; pair with a per-backend --cache file).
@@ -26,6 +26,11 @@ Usage:
     # omit --cache → pure transparent forwarder
     # --shadow → warm the store but always forward, never serve (safe warmup)
     # GET /__cache__/stats → JSON stats
+
+Degraded replies are never stored: a non-200 status, an `X-LLM-Degraded` header,
+a `"degraded"`/`"error"` field in the JSON body or any SSE event, an empty reply, or
+text that starts with an `[Error…`/`[ERROR…`/`[HTTP Error…` signal (what the proxies
+in this kit emit on failure). Such replies are still passed through to the client.
 """
 import argparse, base64, json, os, re, sys, threading, time
 import http.client
@@ -56,6 +61,7 @@ class VariantCache:
         self.misses = 0
         self.stored = 0
         self.rejected = 0
+        self.refused = 0        # degraded upstream replies passed through, not stored
         self._load()
 
     def _load(self):
@@ -182,7 +188,8 @@ class VariantCache:
             variants = sum(len(self.candidates(k)) for k in self.store)
             return {"keys": keys, "variants_for_tag": variants, "model_tag": self.model_tag,
                     "hits": self.hits, "misses": self.misses, "stored": self.stored,
-                    "rejected": self.rejected, "shadow": self.shadow,
+                    "rejected": self.rejected, "refused": self.refused,
+                    "shadow": self.shadow,
                     "max_variants": self.max_variants}
 
     def keyinfo(self, key):
@@ -213,6 +220,72 @@ def _known_truths(prompt):
     prompt (e.g. `- id — "…"`, no brackets) don't match, so this line-anchored
     pattern only picks up the knowledge list."""
     return set(_KNOWN_RE.findall(prompt or ""))
+
+
+DEGRADED_HEADER = "X-LLM-Degraded"
+_ERROR_TEXT_RE = re.compile(r"^\s*\[(?:ERROR|Error|HTTP Error)\b")
+
+
+def _degraded_reason(status, degraded_header, raw):
+    """Why an upstream reply must NOT be stored as a variant, or None if it's fine.
+
+    Upstream proxies in this kit answer failures with HTTP 200 + in-voice fallback
+    or `[Error …]` text (so the end user never sees a raw error), and mark them with
+    an `X-LLM-Degraded` header and/or a `degraded` field on the JSON body / final SSE
+    event. A plain llama-server sends none of those markers, so its replies are
+    judged on status, emptiness and error-text only (backward compatible)."""
+    if status != 200:
+        return f"status {status}"
+    if degraded_header:
+        return f"marked degraded ({degraded_header})"
+    if not raw or not raw.strip():
+        return "empty reply"
+    try:
+        text_in = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "undecodable reply"
+
+    pieces = []
+    events = []
+    if any(ln.startswith("data:") for ln in text_in.splitlines()):
+        for ln in text_in.splitlines():
+            if not ln.startswith("data:"):
+                continue
+            data = ln[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(data))
+            except json.JSONDecodeError:
+                continue
+    else:
+        try:
+            events.append(json.loads(text_in))
+        except json.JSONDecodeError:
+            pieces.append(text_in)          # opaque body: judge the raw text
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("degraded"):
+            return f"marked degraded ({ev.get('degraded')})"
+        if ev.get("error"):
+            return "error field in reply"
+        c = ev.get("content")
+        if c is None and isinstance(ev.get("choices"), list) and ev["choices"]:
+            ch = ev["choices"][0] or {}
+            c = ((ch.get("message") or {}).get("content")
+                 or (ch.get("delta") or {}).get("content") or ch.get("text"))
+        if isinstance(c, str):
+            if _ERROR_TEXT_RE.match(c):
+                return f"error text: {c.strip()[:60]}"
+            pieces.append(c)
+    if events and not "".join(pieces).strip() and not any(
+            isinstance(ev, dict) and ev.get("tool_calls") for ev in events):
+        return "empty content"
+    if pieces and _ERROR_TEXT_RE.match("".join(pieces)):
+        return "error text"
+    return None
 
 
 CACHE = None          # VariantCache or None (pure pass-through)
@@ -330,15 +403,20 @@ class Handler(BaseHTTPRequestHandler):
             tweaked = _apply_sampler_overrides(dict(req), widen=(regen or CACHE.shadow))
             if tweaked is not None:
                 fwd_body = json.dumps(tweaked).encode()
-        status, ctype, raw = self._forward(fwd_body, capture=True)
-        if raw and status == 200:
+        status, ctype, raw, degraded_hdr = self._forward(fwd_body, capture=True)
+        why = _degraded_reason(status, degraded_hdr, raw)
+        if why:
+            with CACHE.lock:
+                CACHE.refused += 1
+            print(f"[cache-proxy] NOT STORED {key[:64]}  ({why})", file=sys.stderr)
+        else:
             n = CACHE.add(key, raw, ctype, tokens=_count_tokens(raw), regen=regen)
             tag = "REGEN" if regen else ("SHADOW-STORE" if CACHE.shadow else "STORE")
             print(f"[cache-proxy] {tag} {key[:64]}  (variant {n})", file=sys.stderr)
 
     def _forward(self, body, capture=False):
         """Stream the request through to UPSTREAM and the response back to the client.
-        Returns (status, content_type, raw_bytes|b'')."""
+        Returns (status, content_type, raw_bytes|b'', degraded_header|'')."""
         host, port = UPSTREAM
         fwd_headers = {}
         ct = self.headers.get("Content-Type")
@@ -357,10 +435,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(msg)
             except Exception:
                 pass
-            return 502, "application/json", b""
+            return 502, "application/json", b"", ""
 
         ctype = resp.getheader("Content-Type", "application/json")
-        self._send_head(resp.status, ctype, None)  # streamed: no content-length, Connection: close
+        degraded = resp.getheader(DEGRADED_HEADER, "") or ""
+        # streamed: no content-length, Connection: close. The degraded marker is
+        # passed on so a cache/client further down the chain sees it too.
+        self._send_head(resp.status, ctype, None,
+                        extra={DEGRADED_HEADER: degraded} if degraded else None)
         buf = bytearray() if capture else None
         try:
             while True:
@@ -375,11 +457,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             conn.close()
-        return resp.status, ctype, bytes(buf) if buf is not None else b""
+        return resp.status, ctype, bytes(buf) if buf is not None else b"", degraded
 
-    def _send_head(self, status, ctype, length):
+    def _send_head(self, status, ctype, length, extra=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         if length is not None:
             self.send_header("Content-Length", str(length))
         self.send_header("Access-Control-Allow-Origin", "*")

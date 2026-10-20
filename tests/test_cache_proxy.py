@@ -7,7 +7,8 @@ import tempfile
 import unittest
 import urllib.parse
 
-from helpers import FakeLlama, RunningServer, get_json, load_proxy, post_json, sse_text
+from helpers import (FakeLlama, RunningServer, ScriptedUpstream, get_json, load_proxy,
+                     post_json, sse_body, sse_text)
 
 cp = load_proxy("cache-proxy.py", "cache_proxy")
 
@@ -142,6 +143,135 @@ class CacheProxyHTTPTest(unittest.TestCase):
         fwd = json.loads(self.up.posts()[0][2])
         self.assertEqual(fwd["n_predict"], 16)
         self.assertEqual(fwd["repeat_penalty"], 1.1)
+
+
+class DegradedReplyNotCachedTest(unittest.TestCase):
+    """Regression: fallback / error replies come back as HTTP 200 from the upstream
+    proxies; cache-proxy used to store them as variants and replay them forever."""
+
+    KEY = "|v1|S01|deg"
+
+    def setUp(self):
+        self._quiet = contextlib.redirect_stderr(io.StringIO())
+        self._quiet.__enter__()
+        self.tmp = tempfile.mkdtemp()
+        self.up = ScriptedUpstream()
+        cp.UPSTREAM = ("127.0.0.1", self.up.port)
+        cp.UP_TIMEOUT = 10
+        cp.REGEN_TEMP = 0.0
+        cp.CLAMP_N_PREDICT = 0
+        cp.REPEAT_PENALTY = 0.0
+        cp.DRY_MULTIPLIER = 0.0
+        cp.CACHE = cp.VariantCache(os.path.join(self.tmp, "c.json"), model_tag="t")
+        self.proxy = RunningServer(cp.Handler)
+
+    def tearDown(self):
+        self.proxy.close()
+        self.up.close()
+        cp.CACHE = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self._quiet.__exit__(None, None, None)
+
+    def ask(self, **extra):
+        body = {"prompt": "p", "stream": True, "cacheable": True, "cache_key": self.KEY}
+        body.update(extra)
+        return post_json(self.proxy.url + "/completion", body)
+
+    def assert_passed_through_not_stored(self, status=200):
+        got_status, _, raw = self.ask()
+        self.assertEqual(got_status, status)
+        self.assertEqual(raw, self.up.reply[2])               # client still gets it
+        self.assertEqual(cp.CACHE.candidates(self.KEY), [])   # ...but nothing stored
+        self.assertEqual(cp.CACHE.stats()["refused"], 1)
+        # and the next request goes upstream again instead of replaying it
+        self.ask()
+        self.assertEqual(self.up.calls, 2)
+
+    def test_degraded_header_not_stored_and_forwarded(self):
+        self.up.reply = (200, {"X-LLM-Degraded": "fallback"},
+                         sse_body({"content": "There is a pause."}, {"content": "", "stop": True}))
+        status, _, raw = self.ask()
+        self.assertEqual(cp.CACHE.candidates(self.KEY), [])
+        # marker is relayed so anything further down the chain sees it too
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        conn.request("POST", "/completion", body=json.dumps(
+            {"prompt": "p", "cacheable": True, "cache_key": self.KEY}).encode(),
+            headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.getheader("X-LLM-Degraded"), "fallback")
+
+    def test_degraded_field_on_sse_stop_event_not_stored(self):
+        self.up.reply = (200, {}, sse_body({"content": "In-voice fallback prose."},
+                                           {"content": "", "stop": True, "degraded": "fallback"}))
+        self.assert_passed_through_not_stored()
+
+    def test_degraded_field_on_json_reply_not_stored(self):
+        # openrouter-proxy style: non-streaming JSON with an error marker
+        self.up.reply = (200, {"Content-Type": "application/json"},
+                         json.dumps({"content": "[Error 429]", "degraded": "error"}).encode())
+        self.assert_passed_through_not_stored()
+
+    def test_unmarked_error_text_not_stored(self):
+        # older upstreams that don't mark: still refuse "[Error …]" style text
+        for body in (json.dumps({"content": "[Error 429]"}).encode(),
+                     sse_body({"content": "[HTTP Error 529]", "stop": True}),
+                     sse_body({"content": "[ERROR: Overloaded]", "stop": True}),
+                     sse_body({"content": "Half a sentence"},
+                              {"content": "[ERROR: stream reset]", "stop": True})):
+            self.up.reply = (200, {}, body)
+            self.ask()
+        self.assertEqual(cp.CACHE.candidates(self.KEY), [])
+        self.assertEqual(cp.CACHE.stats()["refused"], 4)
+
+    def test_error_field_and_empty_replies_not_stored(self):
+        for body in (json.dumps({"error": {"message": "boom"}}).encode(),
+                     b"",
+                     sse_body({"content": "", "stop": True}),
+                     json.dumps({"content": "  "}).encode()):
+            self.up.reply = (200, {}, body)
+            self.ask()
+        self.assertEqual(cp.CACHE.candidates(self.KEY), [])
+        self.assertEqual(cp.CACHE.stats()["refused"], 4)
+
+    def test_non_200_not_stored(self):
+        self.up.reply = (503, {"Content-Type": "application/json"}, b'{"content": "busy"}')
+        self.assert_passed_through_not_stored(status=503)
+
+    def test_regen_and_shadow_also_refuse_degraded(self):
+        self.up.reply = (200, {}, sse_body({"content": "x"},
+                                           {"content": "", "stop": True, "degraded": "error"}))
+        self.ask(regen=True)
+        cp.CACHE.shadow = True
+        self.ask()
+        self.assertEqual(cp.CACHE.candidates(self.KEY), [])
+
+    def test_plain_llama_server_reply_still_stored(self):
+        # backward compat: a normal unmarked llama-server reply is cached as before,
+        # including one that merely mentions an error mid-prose
+        self.up.reply = (200, {}, sse_body({"content": "The word Error, said softly."},
+                                           {"content": "", "stop": True, "stop_type": "eos"}))
+        self.ask()
+        self.assertEqual(len(cp.CACHE.candidates(self.KEY)), 1)
+        self.assertEqual(cp.CACHE.stats()["refused"], 0)
+
+
+class DegradedReasonUnitTest(unittest.TestCase):
+    def test_classifier(self):
+        r = cp._degraded_reason
+        ok = sse_body({"content": "fine prose"}, {"content": "", "stop": True})
+        self.assertIsNone(r(200, "", ok))
+        self.assertIsNone(r(200, "", json.dumps({"content": "fine"}).encode()))
+        self.assertIsNone(r(200, "", b"opaque but non-empty text"))
+        self.assertIsNone(r(200, "", json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode()))
+        self.assertIsNotNone(r(500, "", ok))
+        self.assertIsNotNone(r(200, "fallback", ok))
+        self.assertIsNotNone(r(200, "", b"   \n"))
+        self.assertIsNotNone(r(200, "", b"[Error: timed out]"))
+        self.assertIsNotNone(r(200, "", json.dumps(
+            {"choices": [{"message": {"content": "[Error 500]"}}]}).encode()))
 
 
 class VariantCacheUnitTest(unittest.TestCase):

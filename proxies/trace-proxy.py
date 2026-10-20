@@ -9,6 +9,7 @@ Usage:
     python3 trace-proxy.py                        # listen 8897, forward to 8898
     python3 trace-proxy.py --port 8897 --backend 8898
     python3 trace-proxy.py --backend-host gpu-box.local --backend 8897  # remote
+    python3 trace-proxy.py --host 0.0.0.0         # listen on all interfaces (default 127.0.0.1)
 
 The client connects to this proxy; the proxy forwards to the real backend.
 """
@@ -18,7 +19,7 @@ import json
 import sys
 import time
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.request
 import urllib.error
 
@@ -124,6 +125,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             first_token_time = None
 
             client_gone = False
+            stopped = False
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace")
                 # Forward raw bytes to client (the client may disconnect early)
@@ -136,6 +138,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         log(DIM, f"RSP #{req_id}", "(client disconnected, aborting backend)")
                         resp.close()  # close backend connection to stop generation
                         break
+
+                if stopped:
+                    # Past the stop event: keep forwarding (the blank line that
+                    # terminates the final SSE event, plus anything trailing) but
+                    # don't parse/log any more.
+                    continue
 
                 stripped = line.strip()
                 if not stripped.startswith("data: "):
@@ -160,7 +168,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         sys.stdout.flush()
 
                     if stop:
-                        break
+                        # Don't break here: the event's terminating blank line
+                        # (and any trailing bytes) must still reach the client,
+                        # or the body is truncated vs what the backend sent.
+                        stopped = True
                 except Exception:
                     pass
 
@@ -213,6 +224,8 @@ def main():
     parser.add_argument("--port", type=int, default=8897, help="Listen port (default: 8897)")
     parser.add_argument("--backend", type=int, default=8898, help="Backend llama-server port (default: 8898)")
     parser.add_argument("--backend-host", default="localhost", help="Backend host (default: localhost)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Interface to listen on (default: 127.0.0.1; use 0.0.0.0 for all)")
     args = parser.parse_args()
 
     backend_url = f"http://{args.backend_host}:{args.backend}"
@@ -222,8 +235,11 @@ def main():
     print(f"{CYAN}  ║{RESET}  :{args.port} → {backend_url}  {CYAN}║{RESET}")
     print(f"{CYAN}  ╚══════════════════════════════════════╝{RESET}\n")
 
-    server = HTTPServer(("0.0.0.0", args.port), ProxyHandler)
-    log(GREEN, "PROXY", f"Listening on :{args.port}, forwarding to {backend_url}")
+    # Threaded so one long streaming generation doesn't block every other caller
+    # (or a /health probe) behind it.
+    server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
+    server.daemon_threads = True
+    log(GREEN, "PROXY", f"Listening on {args.host}:{args.port}, forwarding to {backend_url}")
     log(DIM, "PROXY", "Start llama-server on the backend port, then point your client here\n")
 
     try:

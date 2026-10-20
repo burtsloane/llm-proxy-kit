@@ -89,6 +89,21 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"content": "Answer"})
 
+    def test_error_reply_is_marked_degraded(self):
+        # Regression: "[Error 429]" went out as a plain 200 completion and a
+        # cache-proxy in front stored it as a variant.
+        import http.client
+        with mock.patch.object(orp, "call_openrouter", return_value=("[Error 429]", {})):
+            conn = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+            conn.request("POST", "/completion", body=json.dumps({"prompt": "q"}).encode(),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("X-LLM-Degraded"), "error")
+        self.assertEqual(body, {"content": "[Error 429]", "degraded": "error"})
+
 
 if __name__ == "__main__":
     unittest.main()

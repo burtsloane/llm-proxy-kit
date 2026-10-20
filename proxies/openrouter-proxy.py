@@ -35,6 +35,12 @@ DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324"
 APP_REFERER = os.environ.get("OPENROUTER_REFERER", "")
 APP_TITLE = os.environ.get("OPENROUTER_TITLE", "llm-proxy-kit")
 
+# Error replies go out as HTTP 200 + {"content": "[Error ...]"} so llama.cpp
+# clients keep working; they are marked (header + JSON field) so a response
+# cache in front of this proxy (cache-proxy) never stores them as variants.
+DEGRADED_HEADER = "X-LLM-Degraded"
+ERROR_PREFIX = "[Error"
+
 
 def parse_chatml_prompt(prompt: str) -> list[dict]:
     """Parse ChatML-formatted prompt into OpenAI messages array."""
@@ -236,11 +242,17 @@ class OpenRouterProxyHandler(BaseHTTPRequestHandler):
         print(f"[openrouter] {STATS.summary()}", file=sys.stderr)
 
         # Return in llama-server format
+        degraded = content.startswith(ERROR_PREFIX)
+        payload = {"content": content}
+        if degraded:
+            payload["degraded"] = "error"
         self.send_response(200)
         self._send_cors_headers()
         self.send_header("Content-Type", "application/json")
+        if degraded:
+            self.send_header(DEGRADED_HEADER, "error")
         self.end_headers()
-        response = json.dumps({"content": content})
+        response = json.dumps(payload)
         self.wfile.write(response.encode())
 
 

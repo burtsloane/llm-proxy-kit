@@ -306,14 +306,34 @@ class NarrationCache:
 
 NARRATION_CACHE = None  # set by main() when --cache is given
 
+# Degraded-reply marker. Fallback and error replies go out as HTTP 200 with
+# well-formed SSE (so the end user never sees a raw error), which means a
+# response cache in front of this proxy cannot tell them from real output by
+# status alone. Every such reply is therefore marked twice:
+#   - response header `X-LLM-Degraded: fallback|error` when it is known before
+#     the headers go out (budget exhausted), and
+#   - `"degraded": "fallback"|"error"` on the final SSE stop event (always,
+#     since a streamed failure is only discovered after the headers are sent).
+# cache-proxy refuses to store anything carrying either marker.
+DEGRADED_HEADER = "X-LLM-Degraded"
+ERROR_PREFIXES = ("[ERROR:", "[HTTP Error", "[Error:")
 
-def replay_cached_sse(text: str) -> Generator[str, None, None]:
-    """Emit stored text as llama.cpp-format SSE, mirroring stream_claude_response."""
+
+def _stop_event(degraded: str | None = None, content: str = "") -> str:
+    ev = {"content": content, "stop": True}
+    if degraded:
+        ev["degraded"] = degraded
+    return f"data: {json.dumps(ev)}\n\n"
+
+
+def replay_cached_sse(text: str, degraded: str | None = None) -> Generator[str, None, None]:
+    """Emit stored text as llama.cpp-format SSE, mirroring stream_claude_response.
+    `degraded` ("fallback"/"error") is stamped on the stop event."""
     # Chunk for a streamed feel; size is cosmetic since it's instant.
     step = 120
     for i in range(0, len(text), step):
         yield f"data: {json.dumps({'content': text[i:i+step]})}\n\n"
-    yield f"data: {json.dumps({'content': '', 'stop': True})}\n\n"
+    yield _stop_event(degraded)
 
 
 def parse_chatml_prompt(prompt: str) -> tuple[list[dict], list[dict]]:
@@ -597,6 +617,12 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
     # Accumulate response for debugging
     accumulated_response = []
 
+    # Per-request content-block state. (This used to live on the function object
+    # — stream_claude_response._current_block_type — which concurrent requests on
+    # the threaded server shared and clobbered.)
+    block = {"type": None, "json_seen": False}
+    stop_sent = False
+
     # Retry loop for rate limit handling
     retries = 0
     while retries < MAX_RETRIES:
@@ -645,11 +671,8 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
                                 except json.JSONDecodeError:
                                     continue
 
-                        if not event_json:
+                        if event_json is None:   # `{}` is a valid (empty) payload
                             continue
-
-                        # Track current block type for proper tag closing
-                        current_block_type = getattr(stream_claude_response, '_current_block_type', None)
 
                         # Convert Claude events to llama.cpp format
                         if event_type == "content_block_delta":
@@ -670,31 +693,46 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
                                     accumulated_response.append(text)
                                     chunk_data = f"data: {json.dumps({'content': text})}\n\n"
                                     yield chunk_data
+                            elif delta_type == "input_json_delta":
+                                # Tool-call arguments stream as partial JSON; forward
+                                # them verbatim inside the <tool_call> envelope opened
+                                # at content_block_start.
+                                part = delta.get("partial_json", "")
+                                if part and block["type"] == "tool_use":
+                                    block["json_seen"] = True
+                                    accumulated_response.append(part)
+                                    yield f"data: {json.dumps({'content': part})}\n\n"
 
                         elif event_type == "content_block_start":
-                            block = event_json.get("content_block", {})
-                            block_type = block.get("type")
-                            stream_claude_response._current_block_type = block_type
+                            cblock = event_json.get("content_block", {})
+                            block_type = cblock.get("type")
+                            block["type"] = block_type
+                            block["json_seen"] = False
 
                             if block_type == "thinking":
                                 accumulated_response.append('<think>')
                                 yield f"data: {json.dumps({'content': '<think>'})}\n\n"
                             elif block_type == "tool_use":
-                                tool_name = block.get("name", "")
-                                accumulated_response.append(f'<tool_call>{{"name": "{tool_name}", "arguments": ')
-                                yield f"data: {json.dumps({'content': f'<tool_call>{{\"name\": \"{tool_name}\", \"arguments\": '})}\n\n"
+                                tool_name = cblock.get("name", "")
+                                opener = '<tool_call>{"name": ' + json.dumps(tool_name) + ', "arguments": '
+                                accumulated_response.append(opener)
+                                yield f"data: {json.dumps({'content': opener})}\n\n"
 
                         elif event_type == "content_block_stop":
                             # Close tags based on what type of block just ended
-                            block_type = getattr(stream_claude_response, '_current_block_type', None)
+                            block_type = block["type"]
                             if block_type == "thinking":
                                 accumulated_response.append('</think>')
                                 yield f"data: {json.dumps({'content': '</think>'})}\n\n"
                             elif block_type == "tool_use":
-                                # Close the tool_call tag (arguments JSON was already streamed)
-                                accumulated_response.append('}}</tool_call>')
-                                yield f"data: {json.dumps({'content': '}}</tool_call>'})}\n\n"
-                            stream_claude_response._current_block_type = None
+                                # Arguments JSON was streamed via input_json_delta; a
+                                # tool with no input streams none, so supply `{}`.
+                                # Then close the envelope's outer object + tag.
+                                closer = ('' if block["json_seen"] else '{}') + '}</tool_call>'
+                                accumulated_response.append(closer)
+                                yield f"data: {json.dumps({'content': closer})}\n\n"
+                            block["type"] = None
+                            block["json_seen"] = False
 
                         elif event_type == "message_start":
                             # Capture initial usage (input tokens, cache stats)
@@ -712,7 +750,11 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
                             print(f"[claude-proxy] Input tokens (uncached): {request_usage['input_tokens']}", file=sys.stderr)
 
                         elif event_type == "message_stop":
-                            yield f"data: {json.dumps({'content': '', 'stop': True})}\n\n"
+                            # Normally the stop event already went out with
+                            # message_delta's stop_reason; emit one only if not.
+                            if not stop_sent:
+                                stop_sent = True
+                                yield _stop_event()
 
                         elif event_type == "message_delta":
                             delta = event_json.get("delta", {})
@@ -746,12 +788,15 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
                                 print(f"[claude-proxy] Cache stats: {CACHE_STATS.summary()}", file=sys.stderr)
                                 print(f"{'='*80}\n", file=sys.stderr)
 
-                                yield f"data: {json.dumps({'content': '', 'stop': True})}\n\n"
+                                if not stop_sent:
+                                    stop_sent = True
+                                    yield _stop_event()
 
                         elif event_type == "error":
                             error_msg = event_json.get("error", {}).get("message", "Unknown error")
                             print(f"[claude-proxy] API Error: {error_msg}", file=sys.stderr)
-                            yield f"data: {json.dumps({'content': f'[ERROR: {error_msg}]', 'stop': True})}\n\n"
+                            stop_sent = True
+                            yield _stop_event("error", f'[ERROR: {error_msg}]')
 
                 # Success - exit the retry loop
                 return
@@ -797,12 +842,12 @@ def stream_claude_response(system_blocks: list[dict], messages: list[dict], api_
             else:
                 # Non-retriable error or out of retries
                 print(f"[claude-proxy] HTTP Error {e.code}: {error_body}", file=sys.stderr)
-                yield f"data: {json.dumps({'content': f'[HTTP Error {e.code}]', 'stop': True})}\n\n"
+                yield _stop_event("error", f'[HTTP Error {e.code}]')
                 return
 
         except Exception as e:
             print(f"[claude-proxy] Error: {e}", file=sys.stderr)
-            yield f"data: {json.dumps({'content': f'[Error: {str(e)}]', 'stop': True})}\n\n"
+            yield _stop_event("error", f'[Error: {str(e)}]')
             return
 
 
@@ -898,18 +943,16 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header(DEGRADED_HEADER, "fallback")
             self.send_header("Connection", "close")
             self.end_headers()
             try:
-                for chunk in replay_cached_sse(FALLBACK_TEXT):
+                for chunk in replay_cached_sse(FALLBACK_TEXT, degraded="fallback"):
                     self.wfile.write(chunk.encode("utf-8"))
                 self.wfile.flush()
             except BrokenPipeError:
                 pass
             return
-
-        # Clear any stale state from previous interrupted requests
-        stream_claude_response._current_block_type = None
 
         # Parse ChatML prompt into system blocks and messages
         system_blocks, messages = parse_chatml_prompt(prompt)
@@ -947,15 +990,15 @@ class ClaudeProxyHandler(BaseHTTPRequestHandler):
                     except (json.JSONDecodeError, AttributeError):
                         pass
                 if (not got_prose and isinstance(content, str)
-                        and content.startswith(("[ERROR:", "[HTTP Error", "[Error:"))):
+                        and content.startswith(ERROR_PREFIXES)):
                     print(f"[claude-proxy] Terminal API failure before any prose "
                           f"({content[:60]}) — serving authored fallback", file=sys.stderr)
-                    for fb in replay_cached_sse(FALLBACK_TEXT):
+                    for fb in replay_cached_sse(FALLBACK_TEXT, degraded="fallback"):
                         self.wfile.write(fb.encode('utf-8'))
                     self.wfile.flush()
                     capture = None  # never cache the fallback
                     break
-                if content and not str(content).startswith(("[ERROR:", "[HTTP Error", "[Error:")):
+                if content and not str(content).startswith(ERROR_PREFIXES):
                     got_prose = True
                 self.wfile.write(chunk.encode('utf-8'))
                 self.wfile.flush()

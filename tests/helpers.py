@@ -136,3 +136,45 @@ def sse_text(raw):
             except json.JSONDecodeError:
                 pass
     return "".join(out)
+
+
+class ScriptedUpstream:
+    """Fake upstream that answers every POST with a fixed (status, headers, body)
+    — for feeding a proxy degraded/error replies. `reply` may be replaced between
+    requests."""
+
+    def __init__(self, status=200, headers=None, body=b""):
+        self.reply = (status, headers or {}, body)
+        self.calls = 0
+        up = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                if n:
+                    self.rfile.read(n)
+                up.calls += 1
+                status, hdrs, body = up.reply
+                self.send_response(status)
+                hdrs = dict(hdrs)
+                hdrs.setdefault("Content-Type", "text/event-stream")
+                for k, v in hdrs.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = RunningServer(H)
+        self.url = self.server.url
+        self.port = self.server.port
+
+    def close(self):
+        self.server.close()
+
+
+def sse_body(*events):
+    """Build a llama.cpp-style SSE body from event dicts."""
+    return "".join(f"data: {json.dumps(e)}\n\n" for e in events).encode()

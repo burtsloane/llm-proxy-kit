@@ -40,7 +40,7 @@ cache-proxy and the backend. If you omit `--cache`, cache-proxy just forwards re
 
 | File | What it does | Key flags |
 |---|---|---|
-| `proxies/trace-proxy.py` | Transparent forwarder. Logs each request (`n_predict`, temperature, stream flag, the tail of the prompt) and prints streamed tokens live, with TTFB/TTFT and total time. GETs such as `/health` pass through. | `--port` (8897), `--backend` port (8898), `--backend-host` (localhost) |
+| `proxies/trace-proxy.py` | Transparent forwarder. Logs each request (`n_predict`, temperature, stream flag, the tail of the prompt) and prints streamed tokens live, with TTFB/TTFT and total time. GETs such as `/health` pass through. Threaded, so a slow stream doesn't block other callers. | `--port` (8897), `--host` (127.0.0.1), `--backend` port (8898), `--backend-host` (localhost) |
 | `proxies/cache-proxy.py` | Backend-agnostic response cache (see below). Requests without `cacheable`+`cache_key` pass straight through. | `--port` (8897), `--host`, `--upstream` (http://localhost:8898), `--cache PATH`, `--model-tag`, `--max-variants` (8), `--scene-caps`, `--shadow`, `--timeout`, `--regen-temp`, `--clamp-n-predict`, `--repeat-penalty`, `--dry-multiplier`/`--dry-base`/`--dry-allowed-length` |
 | `proxies/claude-proxy.py` | Turns a llama.cpp `/completion` request into an Anthropic Messages streaming call and sends the reply back as llama.cpp-style SSE. Sets prompt-cache breakpoints on the system prompt, enforces a spend budget, and serves authored fallback text when a call fails. | `--port` (8081), `--host`, `--model`, `--effort`, `--no-cache`, `--max-per-hour`, `--max-per-day`, `--budget-ledger`, `--fallback-text`/`--fallback-file`, `--prefix`, `--notification-roles`/`--notification-label`, `--cache`/`--cache-shadow` (older in-process cache) |
 | `proxies/openrouter-proxy.py` | Turns a llama.cpp `/completion` request into an OpenAI-style chat completion on OpenRouter, so any OpenRouter model can stand in for llama-server. Retries on 429. | `--port` (8897), `--host`, `--model` (default `deepseek/deepseek-chat-v3-0324`); env `OPENROUTER_REFERER`, `OPENROUTER_TITLE` |
@@ -101,7 +101,8 @@ streams, JSON replies, and any backend's output format all work the same way.
 | `reject: true` | Drops the variant this proxy last served (or stored) for the key, then works like `regen` to fetch a replacement. |
 
 - **Pools:** each key holds a list of variants. A hit picks `hits % N` from the eligible
-  variants, so repeated requests rotate through the pool instead of replaying the same
+  variants, using that key's own hit counter (shared by every client, not tracked per
+  session), so repeated requests rotate through the pool instead of replaying the same
   text. Identical bytes are deduplicated. Pool size is capped by `--max-variants`, and
   `--scene-caps 'S01=20,S02=12'` sets per-group caps. The group is field 2 of a
   `|`-delimited key such as `|content_ver|prompt_ver|scene|hash`.
@@ -119,11 +120,18 @@ streams, JSON replies, and any backend's output format all work the same way.
   `- [some_id] statement`. Cache keys therefore stay independent of state while one pool
   still holds state-appropriate variants. If the gates rule out every variant, the proxy
   falls back to the ungated variants and then to any variant. A gated key never misses.
+- **Degraded replies are never stored:** a reply is passed through to the client but
+  not added to the pool if the upstream status isn't 200, it carries an
+  `X-LLM-Degraded` header (forwarded on to the client), the JSON body or any SSE event
+  has a `degraded` or `error` field, the content is empty, or the text starts with
+  `[Error`, `[ERROR` or `[HTTP Error`. claude-proxy and openrouter-proxy mark their
+  fallback and error replies this way. A plain llama-server sends no markers, so its
+  normal replies are cached as before. Refusals are counted as `refused` in the stats.
 - **Sampler overrides:** `--clamp-n-predict`, `--repeat-penalty`, and the `--dry-*` flags
   rewrite sampler settings on forwarded generations only. They never change the cache
   key. Use them when the client hard-codes sampler settings that degrade output.
 - **Endpoints:** `GET /__cache__/stats` returns keys, variants for this tag, hits, misses,
-  stored, rejected, and shadow/model-tag info.
+  stored, rejected, refused (degraded replies not stored), and shadow/model-tag info.
   `GET /__cache__/keyinfo?key=<cache_key>` returns which variant the curator is looking
   at (`index` of `total`, plus variant ids). A curation UI can show "variant 3 of 7" with
   regenerate and reject buttons.
@@ -144,7 +152,10 @@ streams, JSON replies, and any backend's output format all work the same way.
 - **Failures read as normal output.** When claude-proxy is over budget, or the API fails
   before any text has streamed (bad key, spend cap reached, 4xx/5xx), it returns
   `--fallback-text` as an ordinary, well-formed completion. A raw `[HTTP Error 401]`
-  never shows up in the UI. Write the fallback so it fails closed: if a caller treats
+  never shows up in the UI. Because it is still HTTP 200, the reply is marked: an
+  `X-LLM-Degraded: fallback` header when that is known before streaming starts (budget
+  exhausted), and `"degraded": "fallback"` or `"error"` on the final SSE stop event in
+  every case. cache-proxy uses those markers to keep fallbacks out of the cache. Write the fallback so it fails closed: if a caller treats
   model output as a verdict (for example, an LLM judge that answers PASS/FAIL), the
   fallback must not parse as a pass. Rate limits use capped exponential backoff with
   jitter and honor `Retry-After`. While waiting, the proxy sends empty keepalive chunks
@@ -154,6 +165,10 @@ streams, JSON replies, and any backend's output format all work the same way.
   enforces a sliding hourly window and a daily cap (UTC). The counts are stored in a
   ledger file, so a crash loop cannot reset them. Cache hits never count against the
   budget.
+- **Tool calls.** A Claude `tool_use` block is streamed to the client as
+  `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` in the text, with the
+  arguments forwarded from the API's `input_json_delta` events as they arrive (`{}` for
+  a tool with no input). Each response emits exactly one stop event.
 - **Prompt caching.** claude-proxy treats any raw text before the first ChatML marker as
   system context. It splits that text on `## ` headers and places one cache breakpoint
   about two-thirds of the way through, so the stable part of the system prompt is billed
