@@ -1,0 +1,8 @@
+# response caches, budget ledgers, atomic-write temp files
+*.json
+*.json.tmp
+__pycache__/
+*.pyc
+.env
+.env.*
+.DS_Store
